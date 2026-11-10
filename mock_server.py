@@ -27,7 +27,14 @@ REAL_BAIDU = (b'<!DOCTYPE html><!--STATUS OK--><html><head>'
 PORTAL_REDIRECT = ("http://59.68.177.9/srun_portal_pc?ac_id=1&theme=basic"
                    "&url=http://www.baidu.com/")
 
-STATE = {"logged_in": False, "last_form": None, "last_ct": None, "last_method": None}
+STATE = {"logged_in": False, "last_form": None, "last_ct": None, "last_method": None,
+         # 当前这个 IP 上“在线”的账号：None 表示没人上线
+         "online_user": None,
+         # 测试用开关：让 /api/account/info 等查询接口返回 404
+         "hide_session": False,
+         # 测试用开关：让退出接口返回 500
+         "logout_fail": False,
+         "logout_form": None}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -47,7 +54,46 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
 
     def do_GET(self):
-        if self.path.startswith("/probe"):
+        if self.path.startswith("/api/account/logout"):
+            # WUST 门户前端就是 $.get('/api/account/logout')，即 GET
+            if STATE["logout_fail"]:
+                self._send(200, json.dumps({"code": 1, "msg": "退出失败"},
+                                           ensure_ascii=False).encode("utf-8"),
+                           "application/json;charset=UTF-8")
+                return
+            STATE["logout_form"] = (self.path,)
+            STATE["online_user"] = None
+            STATE["logged_in"] = False
+            self._send(200, json.dumps({"code": 0, "msg": "已退出登录"},
+                                       ensure_ascii=False).encode("utf-8"),
+                       "application/json;charset=UTF-8")
+        elif self.path.startswith("/api/account/info") or \
+             self.path.startswith("/api/account/online") or \
+             self.path.startswith("/api/account/status"):
+            # 模拟“查询当前在线账号”接口
+            if STATE["hide_session"]:
+                self._send(404)
+                return
+            user = STATE["online_user"] or ""
+            body = json.dumps({"code": 0, "online_ip": "10.15.34.169",
+                               "username": user, "nasId": "1"},
+                              ensure_ascii=False).encode("utf-8")
+            self._send(200, body, "application/json;charset=UTF-8")
+        elif self.path.startswith("/set-online"):
+            # 测试辅助：/set-online?user=xxx 设定当前在线账号
+            q = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            STATE["online_user"] = q.get("user", [""])[0] or None
+            STATE["logged_in"] = STATE["online_user"] is not None
+            self._send(200, b"ok")
+        elif self.path.startswith("/hide-session"):
+            q = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            STATE["hide_session"] = q.get("on", ["1"])[0] == "1"
+            self._send(200, b"ok")
+        elif self.path.startswith("/logout-fail"):
+            q = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            STATE["logout_fail"] = q.get("on", ["1"])[0] == "1"
+            self._send(200, b"ok")
+        elif self.path.startswith("/probe"):
             # 未认证：像真实门户那样把“你请求的地址”当参数回填，或者直接 302 跳门户
             if STATE["logged_in"]:
                 self._send(200, REAL_BAIDU, "text/html")
@@ -118,15 +164,35 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(n).decode("utf-8")
-        STATE["last_form"] = raw
         STATE["last_ct"] = self.headers.get("Content-Type")
         STATE["last_method"] = self.command
+
+        # 退出登录
+        if self.path.startswith("/api/account/logout"):
+            STATE["logout_form"] = raw
+            if STATE["logout_fail"]:
+                self._send(500, b'{"code":500,"authMsg":"logout failed"}',
+                           "application/json;charset=UTF-8")
+                return
+            q = parse_qs(raw, keep_blank_values=True)
+            who = q.get("username", [""])[0]
+            if STATE["online_user"] is not None and \
+               (who == "" or who == STATE["online_user"]):
+                STATE["online_user"] = None
+                STATE["logged_in"] = False
+            body = json.dumps({"code": 0, "authMsg": "已退出登录"},
+                              ensure_ascii=False).encode("utf-8")
+            self._send(200, body, "application/json;charset=UTF-8")
+            return
+
+        STATE["last_form"] = raw
         q = parse_qs(raw, keep_blank_values=True)
         user = q.get("username", [""])[0]
         pwd = q.get("password", [""])[0]
         nas = q.get("nasId", [""])[0]
         if user == EXPECT_USER and pwd == EXPECT_PASS and nas == "1":
             STATE["logged_in"] = True
+            STATE["online_user"] = user
             resp = {"code": 0, "authMsg": "已登录成功", "nasId": "1"}
         else:
             resp = {"code": 1, "authMsg": "用户名或密码错误"}

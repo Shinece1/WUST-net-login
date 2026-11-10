@@ -84,7 +84,7 @@
 /* 常量                                                                */
 /* ------------------------------------------------------------------ */
 #define APP_NAME            "wust-auth"
-#define APP_VERSION         "1.2"
+#define APP_VERSION         "1.4"
 #define CONFIG_FILE_NAME    "wust_config.ini"
 #define LOG_FILE_NAME       "wust-auth.log"
 /* config_load 在没有文件时给出的原因；首次运行时不必当成错误展示 */
@@ -850,7 +850,8 @@ static const char *json_find_value(const char *json, const char *key)
 
     while ((p = strchr(p, '"')) != NULL) {
         p++;
-        if (strncmp(p, key, klen) == 0 && p[klen] == '"') {
+        /* 键名大小写不敏感：门户可能写 "Username"，也可能写 "username" */
+        if (ci_equal_n(p, key, klen) && p[klen] == '"') {
             const char *q = p + klen + 1u;
             while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') {
                 q++;
@@ -931,6 +932,10 @@ static int json_get_str(const char *json, const char *key, char *out, size_t out
 typedef struct {
     char username[128];
     char password[256];
+    /* 以下为可选项，一般留空用程序内置的默认值 */
+    char nasid[16];              /* 默认 "1" */
+    char session_url[320];       /* 查询“当前在线账号”的地址，支持 %IP%/%NASID% */
+    char logout_url[320];        /* 退出登录的地址（POST 表单） */
 } credentials;
 
 /* 拼路径：dir + 分隔符 + name */
@@ -1339,6 +1344,12 @@ static int config_load(const char *path, credentials *c, char *why, size_t whyle
                     copy_str(c->username, sizeof(c->username), value);
                 } else if (strcmp(p, "password") == 0 || strcmp(p, "pass") == 0) {
                     copy_str(c->password, sizeof(c->password), value);
+                } else if (strcmp(p, "nasid") == 0 || strcmp(p, "nas_id") == 0) {
+                    copy_str(c->nasid, sizeof(c->nasid), value);
+                } else if (strcmp(p, "session_url") == 0) {
+                    copy_str(c->session_url, sizeof(c->session_url), value);
+                } else if (strcmp(p, "logout_url") == 0) {
+                    copy_str(c->logout_url, sizeof(c->logout_url), value);
                 }
             }
         }
@@ -1393,6 +1404,15 @@ static int config_save(const char *path, const credentials *c)
     fputs("# 需要修改账号密码时，重新运行程序选择菜单 2 即可。\r\n", f);
     fprintf(f, "username=%s\r\n", c->username);
     fprintf(f, "password=%s\r\n", c->password);
+    if (c->nasid[0] != '\0') {
+        fprintf(f, "nasid=%s\r\n", c->nasid);
+    }
+    if (c->session_url[0] != '\0') {
+        fprintf(f, "session_url=%s\r\n", c->session_url);
+    }
+    if (c->logout_url[0] != '\0') {
+        fprintf(f, "logout_url=%s\r\n", c->logout_url);
+    }
     if (fclose(f) != 0) {
         return -1;
     }
@@ -1828,6 +1848,363 @@ static int check_online(int verbose, char *errbuf, size_t errlen)
     return online;
 }
 
+/* ------------------------------------------------------------------ */
+/* 在线会话：查询“当前是谁在用这个 IP 上网” / 退出登录                  */
+/* ------------------------------------------------------------------ */
+/*
+ * 为什么要这个：开机时如果这个 IP 上挂着别人的账号，你那台电脑看起来
+ * “已经能上网”，但认证服务器不认你的学号，你一登录就报错、网络反而不能用。
+ * 所以先问清楚当前在线的是谁：不是自己就先把那个会话踢掉，再用自己的账号登录。
+ */
+
+typedef struct {
+    int  known;                 /* 1 = 查询成功（哪怕结果是“没人在线”） */
+    int  ours;                  /* 1 = 在线账号就是配置文件里的那个 */
+    char user[128];             /* 在线账号，空表示没有在线会话 */
+    char endpoint[320];         /* 真正查询成功的地址（便于写回配置） */
+    char raw[512];              /* 原始响应片段，-v 时打印 */
+    char error[256];
+} session_info;
+
+/* 取本机在校园网里的 IP（UDP connect 不发包，只为拿到出口地址） */
+static int local_ip_for(const char *host, const char *port, char *out, size_t outlen)
+{
+    struct addrinfo  hints;
+    struct addrinfo *res = NULL;
+    WUST_SOCKET      fd;
+    struct sockaddr_storage ss;
+    socklen_t        slen = (socklen_t)sizeof(ss);
+    int              rc;
+
+    if (outlen > 0u) {
+        out[0] = '\0';
+    }
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    rc = getaddrinfo(host, port, &hints, &res);
+    if (rc != 0 || res == NULL) {
+        if (res != NULL) {
+            freeaddrinfo(res);
+        }
+        return -1;
+    }
+    fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd == WUST_INVALID_SOCKET) {
+        freeaddrinfo(res);
+        return -1;
+    }
+    rc = connect(fd, res->ai_addr, (int)res->ai_addrlen);
+    freeaddrinfo(res);
+    if (rc != 0) {
+        wust_close_socket(fd);
+        return -1;
+    }
+    rc = getsockname(fd, (struct sockaddr *)&ss, &slen);
+    wust_close_socket(fd);
+    if (rc != 0 || ss.ss_family != AF_INET) {
+        return -1;
+    }
+    {
+        const struct sockaddr_in *in4 = (const struct sockaddr_in *)(const void *)&ss;
+        if (inet_ntop(AF_INET, (const void *)&in4->sin_addr, out, (socklen_t)outlen) == NULL) {
+            out[0] = '\0';
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* 从登录地址推出门户根地址，例如 http://59.68.177.9 */
+static int portal_origin(char *out, size_t outlen)
+{
+    url_parts u;
+
+    if (url_parse(login_url(), &u) != 0) {
+        return -1;
+    }
+    if (strcmp(u.port, "80") == 0) {
+        if (snprintf(out, outlen, "http://%s", u.host) >= (int)outlen) {
+            return -1;
+        }
+    } else {
+        if (snprintf(out, outlen, "http://%s:%s", u.host, u.port) >= (int)outlen) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* 把 %IP% / %NASID% / %USER% 替换进地址模板 */
+static int subst_url(const char *tpl, const char *ip, const char *nasid,
+                     const char *user, char *out, size_t outlen)
+{
+    size_t      o = 0u;
+    const char *p = tpl;
+
+    while (*p != '\0') {
+        const char *rep = NULL;
+        size_t      keylen = 0u;
+
+        if (strncmp(p, "%IP%", 4u) == 0) {
+            rep = ip;
+            keylen = 4u;
+        } else if (strncmp(p, "%NASID%", 7u) == 0) {
+            rep = nasid;
+            keylen = 7u;
+        } else if (strncmp(p, "%USER%", 6u) == 0) {
+            rep = user;
+            keylen = 6u;
+        }
+        if (rep != NULL) {
+            size_t rl = strlen(rep);
+            if (o + rl + 1u > outlen) {
+                return -1;
+            }
+            memcpy(out + o, rep, rl);
+            o += rl;
+            p += keylen;
+        } else {
+            if (o + 2u > outlen) {
+                return -1;
+            }
+            out[o++] = *p++;
+        }
+    }
+    out[o] = '\0';
+    return 0;
+}
+
+/* 从响应正文里找在线账号 */
+static int parse_online_user(const char *body, char *out, size_t outlen)
+{
+    static const char *const keys[] = { "username", "userName", "user_name", "account", "user" };
+    size_t i;
+
+    out[0] = '\0';
+    for (i = 0u; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        if (json_get_str(body, keys[i], out, outlen) == 0 && out[0] != '\0') {
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* 本次运行里已经验证可用的查询地址（跨调用缓存，减少请求数） */
+static char g_session_endpoint[400];
+
+/* 查询当前在线账号；查不到时 si->known = 0，调用方退回原来的探测逻辑 */
+static void session_query(const credentials *c, int verbose, session_info *si)
+{
+    /* 未认证门户的常见查询地址；第一项是 WUST 实测可用的 */
+    static const char *const paths[] = {
+        "/api/account/status?ip=%IP%&nasId=%NASID%",
+        "/api/account/info?ip=%IP%&nasId=%NASID%",
+        "/api/account/online?ip=%IP%&nasId=%NASID%",
+        "/api/account/detail?ip=%IP%&nasId=%NASID%",
+        "/api/account/query?ip=%IP%&nasId=%NASID%",
+        "/cgi-bin/rad_user_info?ip=%IP%",
+        NULL
+    };
+    char        origin[320];
+    char        ip[64];
+    char        nasid[16];
+    char        tpl[400];
+    char        url[600];
+    const char *cand[16];
+    size_t      ncand = 0u;
+    size_t      i;
+    url_parts   u;
+
+    memset(si, 0, sizeof(*si));
+    copy_str(nasid, sizeof(nasid), (c->nasid[0] != '\0') ? c->nasid : "1");
+
+    ip[0] = '\0';
+    if (portal_origin(origin, sizeof(origin)) != 0) {
+        copy_str(si->error, sizeof(si->error), "无法解析门户地址");
+        return;
+    }
+    if (url_parse(login_url(), &u) == 0) {
+        (void)local_ip_for(u.host, u.port, ip, sizeof(ip));
+    }
+    if (ip[0] == '\0') {
+        (void)local_ip_for(u.host, "80", ip, sizeof(ip));
+    }
+    if (ip[0] == '\0') {
+        copy_str(ip, sizeof(ip), "0.0.0.0");
+    }
+
+    /* 配置里指定了就用它，否则依次试候选地址 */
+    if (c->session_url[0] != '\0') {
+        cand[ncand++] = c->session_url;
+    } else {
+        /* 本次运行里已经成功过的地址优先，避免每次重试都试一遍所有候选 */
+        if (g_session_endpoint[0] != '\0') {
+            cand[ncand++] = g_session_endpoint;
+        }
+        for (i = 0u; paths[i] != NULL && ncand < 15u; i++) {
+            if (snprintf(tpl, sizeof(tpl), "%s%s", origin, paths[i]) < (int)sizeof(tpl)) {
+                /* 需要长期保存，拷到静态区 */
+                static char store[16][400];
+                static size_t used = 0u;
+                if (used < 16u) {
+                    int dup = 0;
+                    size_t k;
+                    for (k = 0u; k < ncand; k++) {
+                        if (strcmp(cand[k], tpl) == 0) {
+                            dup = 1;
+                            break;
+                        }
+                    }
+                    if (!dup) {
+                        copy_str(store[used], sizeof(store[0]), tpl);
+                        cand[ncand++] = store[used++];
+                    }
+                }
+            }
+        }
+    }
+
+    for (i = 0u; i < ncand; i++) {
+        http_response resp;
+
+        if (subst_url(cand[i], ip, nasid, c->username, url, sizeof(url)) != 0) {
+            continue;
+        }
+        if (http_request("GET", url, NULL, NULL, PROBE_TIMEOUT_SEC, &resp) != 0) {
+            if (verbose) {
+                printf("      [会话] %s -> 连接失败：%s\n", url, resp.error);
+            }
+            http_response_free(&resp);
+            continue;
+        }
+        if (verbose) {
+            printf("      [会话] %s -> HTTP %d\n", url, resp.status);
+        }
+        if (resp.status == 200 && resp.body != NULL && resp.body_len > 0u
+            && strchr(resp.body, '{') != NULL) {
+            size_t n = resp.body_len;
+            if (n > sizeof(si->raw) - 1u) {
+                n = sizeof(si->raw) - 1u;
+            }
+            memcpy(si->raw, resp.body, n);
+            si->raw[n] = '\0';
+            si->known = 1;
+            copy_str(si->endpoint, sizeof(si->endpoint), cand[i]);
+            copy_str(g_session_endpoint, sizeof(g_session_endpoint), cand[i]);
+            (void)parse_online_user(resp.body, si->user, sizeof(si->user));
+            http_response_free(&resp);
+            return;
+        }
+        http_response_free(&resp);
+    }
+
+    if (si->error[0] == '\0') {
+        copy_str(si->error, sizeof(si->error),
+                 "所有候选查询地址都没有返回可识别的数据");
+    }
+}
+
+/*
+ * 在线账号和配置里的学号是不是同一个。
+ * 返回 1 = 是我的；0 = 明显不是；-1 = 看不出来（例如被脱敏成 …5048），
+ * 看不出来时一律不退出，避免把自己踢下线。
+ */
+static int session_is_ours(const session_info *si, const credentials *c)
+{
+    char a[128];
+    char b[128];
+    size_t alen;
+    size_t blen;
+
+    copy_str(a, sizeof(a), si->user);
+    copy_str(b, sizeof(b), c->username);
+    lower_str(a);
+    lower_str(b);
+    alen = strlen(a);
+    blen = strlen(b);
+    if (alen == 0u) {
+        return 0;
+    }
+    if (strcmp(a, b) == 0) {
+        return 1;
+    }
+    /* 门户可能只显示后几位（如 …5048），能被配置里的学号“以它结尾”就是自己的 */
+    if (alen >= 4u && alen < blen && strcmp(b + (blen - alen), a) == 0) {
+        return 1;
+    }
+    /* 带掩码字符的，无法判断 */
+    if (strchr(si->user, '*') != NULL || strstr(si->user, "...") != NULL
+        || strstr(si->user, "\xE2\x80\xA6") != NULL) {
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * 退出当前在线会话。
+ * WUST 门户前端就是 $.get(host_url + "/account/logout")，即 GET，不需要表单。
+ * 返回 0 表示门户回话说成功（是否真的下线由调用方再查一次确认）。
+ */
+static int session_logout(const credentials *c, const char *online_user,
+                          int verbose, char *msg, size_t msglen)
+{
+    char         origin[320];
+    char         url[600];
+    long         code = -1;
+    http_response resp;
+
+    (void)online_user;                     /* 接口按 IP 退出，不需要账号 */
+    if (msglen > 0u) {
+        msg[0] = '\0';
+    }
+
+    if (c->logout_url[0] != '\0') {
+        copy_str(url, sizeof(url), c->logout_url);
+    } else {
+        if (portal_origin(origin, sizeof(origin)) != 0) {
+            copy_str(msg, msglen, "无法解析门户地址");
+            return -1;
+        }
+        if (snprintf(url, sizeof(url), "%s/api/account/logout", origin) >= (int)sizeof(url)) {
+            copy_str(msg, msglen, "退出地址过长");
+            return -1;
+        }
+    }
+
+    if (verbose) {
+        printf("      [会话] GET %s\n", url);
+    }
+    if (http_request("GET", url, NULL, NULL, LOGIN_TIMEOUT_SEC, &resp) != 0) {
+        copy_str(msg, msglen, resp.error);
+        http_response_free(&resp);
+        return -1;
+    }
+    if (verbose) {
+        printf("      [会话] 退出响应 HTTP %d：%.300s\n", resp.status,
+               (resp.body != NULL) ? resp.body : "(空)");
+    }
+    if (resp.status < 200 || resp.status >= 400) {
+        snprintf(msg, msglen, "门户返回 HTTP %d", resp.status);
+        http_response_free(&resp);
+        return -1;
+    }
+    /* 门户约定：code=1 表示退出失败，其它值视为成功 */
+    if (resp.body != NULL && json_get_int(resp.body, "code", &code) == 0 && code == 1) {
+        char m[200];
+        m[0] = '\0';
+        (void)json_get_str(resp.body, "msg", m, sizeof(m));
+        if (m[0] == '\0') {
+            (void)json_get_str(resp.body, "authMsg", m, sizeof(m));
+        }
+        snprintf(msg, msglen, "门户拒绝退出：%s", (m[0] != '\0') ? m : "未说明原因");
+        http_response_free(&resp);
+        return -1;
+    }
+    http_response_free(&resp);
+    return 0;
+}
+
 typedef struct {
     int  transport_ok;
     int  has_code;
@@ -1901,13 +2278,68 @@ cleanup:
 static int run_login_flow(const credentials *c, int verbose, int *retryable)
 {
     login_result lr;
+    session_info si;
     char         err[512];
 
     if (retryable != NULL) {
         *retryable = 0;
     }
 
-    printf("\n[1/3] 正在检测网络是否已经连通 ...\n");
+    /* ---------- 第 1 步：先查清“这个 IP 上现在是谁的账号” ---------- */
+    printf("\n[1/4] 正在检查当前在线账号 ...\n");
+    session_query(c, verbose, &si);
+
+    if (si.known) {
+        if (si.user[0] == '\0') {
+            printf("      当前没有在线账号。\n");
+        } else {
+            printf("      当前在线账号：%s\n", si.user);
+        }
+    } else {
+        printf("      查不到在线账号信息（%s），跳过这一步。\n", si.error);
+    }
+    if (verbose && si.raw[0] != '\0') {
+        printf("      [会话] 原始响应：%.300s\n", si.raw);
+    }
+
+    if (si.known && si.user[0] != '\0') {
+        int mine = session_is_ours(&si, c);
+
+        if (mine == 1) {
+            printf("      就是你自己的账号，无需重复认证。\n");
+            return EXIT_OK;
+        }
+        if (mine < 0) {
+            printf("      账号显示不全（含掩码），无法确认是不是你的，为安全起见不退出。\n");
+        } else {
+            char lmsg[300];
+
+            printf("      在线的是【%s】，不是你（%s）。\n", si.user, c->username);
+            printf("      正在退出这个会话，然后用你自己的账号重新登录 ...\n");
+            if (session_logout(c, si.user, verbose, lmsg, sizeof(lmsg)) != 0) {
+                printf("      退出失败：%s\n", lmsg[0] != '\0' ? lmsg : "未知原因");
+                printf("\n登录失败：当前 IP 上挂着别人的账号（%s），自动退出没成功。\n",
+                       si.user);
+                printf("请打开浏览器访问任意网页，在门户页面点“退出”，再运行本程序。\n");
+                return EXIT_FAIL;
+            }
+            msleep(600u);
+            {
+                session_info after;
+                session_query(c, verbose, &after);
+                if (after.known && after.user[0] != '\0'
+                    && session_is_ours(&after, c) == 0) {
+                    printf("      退出没生效，当前仍是【%s】。\n", after.user);
+                    printf("\n登录失败：无法退出他人的在线会话，请手动在门户点“退出”后重试。\n");
+                    return EXIT_FAIL;
+                }
+            }
+            printf("      已退出，继续用你的账号登录。\n");
+        }
+    }
+
+    /* ---------- 第 2 步：网络连通性探测 ---------- */
+    printf("\n[2/4] 正在检测网络是否已经连通 ...\n");
     if (check_online(verbose, err, sizeof(err))) {
         printf("      当前网络已经连通（已在线），无需重复认证。\n");
         return EXIT_OK;
@@ -1917,7 +2349,7 @@ static int run_login_flow(const credentials *c, int verbose, int *retryable)
     }
     printf("      当前未联网，开始认证。\n");
 
-    printf("\n[2/3] 正在向认证服务器提交登录请求（学号 %s）...\n", c->username);
+    printf("\n[3/4] 正在向认证服务器提交登录请求（学号 %s）...\n", c->username);
     do_login_request(c, &lr);
 
     if (verbose) {
@@ -1952,7 +2384,7 @@ static int run_login_flow(const credentials *c, int verbose, int *retryable)
     }
     printf("      登录成功！\n");
 
-    printf("\n[3/3] 正在复检网络连通性 ...\n");
+    printf("\n[4/4] 正在复检网络连通性 ...\n");
     msleep(800u);
     if (check_online(verbose, err, sizeof(err))) {
         printf("      网络已连通，可以正常上网。\n");
@@ -1983,6 +2415,8 @@ static void print_help(const char *prog)
     printf("                  日志文件（wust-auth.log），完全不弹窗、不等输入\n");
     printf("  -v, --verbose   打印探测结果与服务器原始响应，便于排查问题\n");
     printf("  -p, --where     只做配置诊断：显示程序实际使用的配置文件路径和读取结果\n");
+    printf("  -w, --who       查询当前这个 IP 上在线的是哪个账号（只读，不会退出）\n");
+    printf("      --logout    退出当前的在线会话，然后用你自己的账号登录前先清干净\n");
     printf("  -t, --tries N   最多尝试认证几次（默认 3；-q 时为 12）\n");
     printf("  -d, --delay N   每次重试间隔多少秒（默认 5；-q 时为 10）\n");
     printf("  -h, --help      显示本帮助\n\n");
@@ -2167,6 +2601,8 @@ int main(int argc, char **argv)
     int         auto_mode = 0;
     int         verbose   = 0;
     int         where_mode = 0;
+    int         who_mode = 0;
+    int         logout_mode = 0;
     int         quiet_mode = 0;
     int         force_help = 0;
     int         config_ok = 0;
@@ -2206,6 +2642,10 @@ int main(int argc, char **argv)
             where_mode = 1;
         } else if (arg_match(name, "-q", "--quiet", "-quiet")) {
             quiet_mode = 1;
+        } else if (arg_match(name, "-w", "--who", "-who")) {
+            who_mode = 1;
+        } else if (arg_match(name, "--logout", "-logout", NULL)) {
+            logout_mode = 1;
         } else if (arg_match(name, "-h", "--help", "-help") || arg_match(name, "-?", NULL, NULL)) {
             force_help = 1;
         } else if (arg_match(name, "-t", "--tries", "-tries")
@@ -2229,7 +2669,8 @@ int main(int argc, char **argv)
                 }
             }
         } else if (a[0] != '\0') {
-            fprintf(stderr, "未知参数：%s（可用的：-a -q -v -p -h -t N -d N）\n\n", argv[i]);
+            fprintf(stderr, "未知参数：%s（可用的：-a -q -v -p -w --logout -h -t N -d N）\n\n",
+                    argv[i]);
             print_help(argv[0]);
             return EXIT_USAGE;
         }
@@ -2331,6 +2772,103 @@ int main(int argc, char **argv)
         WSACleanup();
 #endif
         return config_ok ? EXIT_OK : EXIT_CONFIG;
+    }
+
+    /* ---------------- 查询当前在线账号（只读） ---------------- */
+    if (who_mode) {
+        session_info si;
+        char         ip[64];
+        char         origin[320];
+        url_parts    u;
+        int          rc_who;
+
+        session_query(&cred, verbose, &si);
+
+        printf("=== 在线账号查询 ===\n");
+        if (portal_origin(origin, sizeof(origin)) == 0) {
+            printf("门户地址  ：%s\n", origin);
+        }
+        ip[0] = '\0';
+        if (url_parse(login_url(), &u) == 0) {
+            (void)local_ip_for(u.host, u.port, ip, sizeof(ip));
+        }
+        printf("本机 IP   ：%s\n", (ip[0] != '\0') ? ip : "(取不到)");
+
+        if (si.known) {
+            printf("查询地址  ：%s\n", si.endpoint);
+            if (si.user[0] != '\0') {
+                printf("在线账号  ：%s\n", si.user);
+            } else {
+                printf("在线账号  ：（当前没有在线会话）\n");
+            }
+            if (cred.username[0] != '\0' && si.user[0] != '\0') {
+                int mine = session_is_ours(&si, &cred);
+                printf("你的学号  ：%s（%s）\n", cred.username,
+                       (mine == 1) ? "一致" : ((mine < 0) ? "无法判断（账号被脱敏）"
+                                                          : "不一致"));
+            }
+            rc_who = EXIT_OK;
+        } else {
+            printf("查询结果  ：失败 —— %s\n", si.error);
+            printf("\n可以这样确定正确地址：浏览器打开校园网门户 → F12 → 网络(Network)\n");
+            printf("→ 刷新页面 → 找到返回账号信息的那条请求 → 复制它的地址，\n");
+            printf("写进 %s：session_url=该地址（可带 %%IP%% 和 %%NASID%% 占位符）\n",
+                   CONFIG_FILE_NAME);
+            rc_who = EXIT_FAIL;
+        }
+        if (si.raw[0] != '\0') {
+            printf("原始响应  ：%.400s\n", si.raw);
+        }
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return rc_who;
+    }
+
+    /* ---------------- 退出当前在线会话 ---------------- */
+    if (logout_mode) {
+        session_info si;
+        session_info after;
+        char         lmsg[300];
+
+        session_query(&cred, verbose, &si);
+        if (!si.known) {
+            printf("查不到在线账号信息（%s），无法确定要不要退出。\n", si.error);
+#ifdef _WIN32
+            WSACleanup();
+#endif
+            return EXIT_FAIL;
+        }
+        if (si.user[0] == '\0') {
+            printf("当前没有在线账号，无需退出。\n");
+#ifdef _WIN32
+            WSACleanup();
+#endif
+            return EXIT_OK;
+        }
+        printf("正在退出在线账号：%s ...\n", si.user);
+        if (session_logout(&cred, si.user, verbose, lmsg, sizeof(lmsg)) != 0) {
+            printf("退出请求失败：%s\n", (lmsg[0] != '\0') ? lmsg : "未知原因");
+#ifdef _WIN32
+            WSACleanup();
+#endif
+            return EXIT_FAIL;
+        }
+        msleep(800u);
+        session_query(&cred, verbose, &after);
+        if (after.known && after.user[0] == '\0') {
+            printf("已退出。\n");
+#ifdef _WIN32
+            WSACleanup();
+#endif
+            return EXIT_OK;
+        }
+        printf("请求已发出，但复查仍看到在线账号：%s\n", after.user);
+        printf("门户可能还需要在网页上确认一次，或者退出接口与当前系统不一致。\n");
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return EXIT_FAIL;
     }
 
     /* ---------------- 静默模式（-a / -q / wust-authw.exe） ---------------- */

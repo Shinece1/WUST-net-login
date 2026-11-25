@@ -42,3 +42,6 @@ __pycache__/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# 工具自身的工作目录（不属于本项目）
+.dshwolf/

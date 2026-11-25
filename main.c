@@ -84,14 +84,14 @@
 /* 常量                                                                */
 /* ------------------------------------------------------------------ */
 #define APP_NAME            "wust-auth"
-#define APP_VERSION         "1.4"
+#define APP_VERSION         "1.5"
 #define CONFIG_FILE_NAME    "wust_config.ini"
 #define LOG_FILE_NAME       "wust-auth.log"
 /* config_load 在没有文件时给出的原因；首次运行时不必当成错误展示 */
 #define CONFIG_WHY_NOFILE   "文件不存在"
 
 /* 深澜认证接口（明文 HTTP，POST 表单） */
-#define DEFAULT_LOGIN_URL   "http://59.68.177.9/api/account/login"
+#define DEFAULT_LOGIN_URL   "http://59.68.177.12/api/account/login"
 /* 联网探测用的地址 */
 #define DEFAULT_PROBE_URL   "http://www.baidu.com"
 
@@ -697,6 +697,33 @@ static int header_find(const char *headers, const char *name, char *out, size_t 
 }
 
 /*
+ * 门户会话信息：新门户加了 CSRF 防护，登录/退出必须同时带上
+ *   1) 从 /api/csrf-token 拿到的 token（放在 X-CSRF-Token 头里）
+ *   2) 同一次请求返回的会话 cookie（放在 Cookie 头里）
+ * 两者是绑定的，只带 token 会被判 “CSRF token mismatch”。
+ * 这些信息只发给门户主机，绝不能带到百度之类的第三方站点上去。
+ */
+static char g_portal_host[256];
+static char g_cookie[600];
+static char g_csrf[300];
+
+static int host_is_portal(const char *host)
+{
+    size_t hl;
+    size_t pl;
+
+    if (g_portal_host[0] == '\0' || host == NULL) {
+        return 0;
+    }
+    hl = strlen(host);
+    pl = strlen(g_portal_host);
+    if (hl != pl) {
+        return 0;
+    }
+    return ci_equal_n(host, g_portal_host, hl);
+}
+
+/*
  * 发起一次 HTTP 请求。
  * 返回 0 表示收到了 HTTP 响应（正文在 resp->body 里），-1 表示传输层失败。
  */
@@ -757,6 +784,19 @@ static int http_request(const char *method, const char *url,
             goto out_of_memory;
         }
     }
+    /* 门户新加的 CSRF 防护：cookie + token 只发给门户，绝不外发 */
+    if (host_is_portal(u.host)) {
+        if (g_cookie[0] != '\0') {
+            if (sb_addf(&req, "Cookie: %s\r\n", g_cookie) != 0) {
+                goto out_of_memory;
+            }
+        }
+        if (g_csrf[0] != '\0') {
+            if (sb_addf(&req, "X-CSRF-Token: %s\r\n", g_csrf) != 0) {
+                goto out_of_memory;
+            }
+        }
+    }
     if (sb_add(&req, "\r\n") != 0) {
         goto out_of_memory;
     }
@@ -809,6 +849,20 @@ static int http_request(const char *method, const char *url,
         char saved = raw.data[hdrlen];
         raw.data[hdrlen] = '\0';
         (void)header_find(raw.data, "Location", resp->location, sizeof(resp->location));
+        /* 记住门户下发的会话 cookie（CSRF token 与它绑定） */
+        if (host_is_portal(u.host)) {
+            char sc[600];
+            sc[0] = '\0';
+            if (header_find(raw.data, "Set-Cookie", sc, sizeof(sc)) == 0) {
+                char *semi = strchr(sc, ';');
+                if (semi != NULL) {
+                    *semi = '\0';
+                }
+                if (sc[0] != '\0') {
+                    copy_str(g_cookie, sizeof(g_cookie), sc);
+                }
+            }
+        }
         raw.data[hdrlen] = saved;
     }
 
@@ -1915,7 +1969,20 @@ static int local_ip_for(const char *host, const char *port, char *out, size_t ou
     return 0;
 }
 
-/* 从登录地址推出门户根地址，例如 http://59.68.177.9 */
+/* 记住门户主机名：只有发给它的请求才带 cookie 与 CSRF token */
+static void init_portal_host(void)
+{
+    url_parts u;
+
+    if (g_portal_host[0] != '\0') {
+        return;
+    }
+    if (url_parse(login_url(), &u) == 0) {
+        copy_str(g_portal_host, sizeof(g_portal_host), u.host);
+    }
+}
+
+/* 从登录地址推出门户根地址，例如 http://59.68.177.12 */
 static int portal_origin(char *out, size_t outlen)
 {
     url_parts u;
@@ -1933,6 +2000,100 @@ static int portal_origin(char *out, size_t outlen)
         }
     }
     return 0;
+}
+
+/* 从门户 /api/config 读取 default_nas（只取一次，之后缓存） */
+static int portal_default_nas(char *out, size_t outlen)
+{
+    static char   cached[16];
+    char          origin[320];
+    char          url[400];
+    http_response resp;
+    int           ok = -1;
+
+    if (outlen > 0u) {
+        out[0] = '\0';
+    }
+    if (cached[0] != '\0') {
+        copy_str(out, outlen, cached);
+        return 0;
+    }
+    if (portal_origin(origin, sizeof(origin)) != 0) {
+        return -1;
+    }
+    if (snprintf(url, sizeof(url), "%s/api/config", origin) >= (int)sizeof(url)) {
+        return -1;
+    }
+    if (http_request("GET", url, NULL, NULL, PROBE_TIMEOUT_SEC, &resp) != 0) {
+        http_response_free(&resp);
+        return -1;
+    }
+    if (resp.status == 200 && resp.body != NULL) {
+        char v[16];
+        v[0] = '\0';
+        if (json_get_str(resp.body, "default_nas", v, sizeof(v)) == 0 && v[0] != '\0') {
+            copy_str(cached, sizeof(cached), v);
+            copy_str(out, outlen, v);
+            ok = 0;
+        }
+    }
+    http_response_free(&resp);
+    return ok;
+}
+
+/* 取一次 CSRF token（同时会记下 /api/csrf-token 下发的会话 cookie） */
+static int portal_csrf_fetch(int verbose)
+{
+    static int    done = 0;
+    char          origin[320];
+    char          url[400];
+    char          tok[300];
+    http_response resp;
+
+    if (done) {
+        return (g_csrf[0] != '\0') ? 0 : -1;
+    }
+    if (portal_origin(origin, sizeof(origin)) != 0) {
+        return -1;
+    }
+    if (snprintf(url, sizeof(url), "%s/api/csrf-token", origin) >= (int)sizeof(url)) {
+        return -1;
+    }
+    tok[0] = '\0';
+    if (http_request("GET", url, NULL, NULL, PROBE_TIMEOUT_SEC, &resp) == 0) {
+        if (resp.status == 200 && resp.body != NULL) {
+            (void)json_get_str(resp.body, "csrf_token", tok, sizeof(tok));
+        }
+        http_response_free(&resp);
+    } else {
+        http_response_free(&resp);
+    }
+    done = 1;
+    if (tok[0] == '\0') {
+        return -1;
+    }
+    copy_str(g_csrf, sizeof(g_csrf), tok);
+    if (verbose) {
+        printf("      [门户] 已取得 CSRF token（会话 cookie：%s）\n",
+               (g_cookie[0] != '\0') ? "有" : "无");
+    }
+    return 0;
+}
+
+/*
+ * nasId：配置文件里写了就用配置（nasid=），否则问门户要它的默认值，
+ * 最后才退回 "1"。门户换机器时这个值可能会变，所以不写死。
+ */
+static void resolve_nasid(const credentials *c, char *out, size_t outlen)
+{
+    if (c->nasid[0] != '\0') {
+        copy_str(out, outlen, c->nasid);
+        return;
+    }
+    if (portal_default_nas(out, outlen) == 0 && out[0] != '\0') {
+        return;
+    }
+    copy_str(out, outlen, "1");
 }
 
 /* 把 %IP% / %NASID% / %USER% 替换进地址模板 */
@@ -2017,7 +2178,7 @@ static void session_query(const credentials *c, int verbose, session_info *si)
     url_parts   u;
 
     memset(si, 0, sizeof(*si));
-    copy_str(nasid, sizeof(nasid), (c->nasid[0] != '\0') ? c->nasid : "1");
+    resolve_nasid(c, nasid, sizeof(nasid));
 
     ip[0] = '\0';
     if (portal_origin(origin, sizeof(origin)) != 0) {
@@ -2162,16 +2323,34 @@ static int session_logout(const credentials *c, const char *online_user,
     if (c->logout_url[0] != '\0') {
         copy_str(url, sizeof(url), c->logout_url);
     } else {
+        /*
+         * 新门户的退出请求是
+         *   $.get(host_url + "/account/logout?" + $.param(postData))
+         * 要带上 userIpv4 / nasId 这些参数，按 IP 定位要退出的会话。
+         */
+        char      ip[64];
+        char      nasid[16];
+        url_parts u;
+
         if (portal_origin(origin, sizeof(origin)) != 0) {
             copy_str(msg, msglen, "无法解析门户地址");
             return -1;
         }
-        if (snprintf(url, sizeof(url), "%s/api/account/logout", origin) >= (int)sizeof(url)) {
+        resolve_nasid(c, nasid, sizeof(nasid));
+        ip[0] = '\0';
+        if (url_parse(login_url(), &u) == 0) {
+            (void)local_ip_for(u.host, u.port, ip, sizeof(ip));
+        }
+        if (snprintf(url, sizeof(url),
+                     "%s/api/account/logout?userIpv4=%s&nasId=%s",
+                     origin, ip, nasid) >= (int)sizeof(url)) {
             copy_str(msg, msglen, "退出地址过长");
             return -1;
         }
     }
 
+    init_portal_host();
+    (void)portal_csrf_fetch(0);
     if (verbose) {
         printf("      [会话] GET %s\n", url);
     }
@@ -2220,10 +2399,21 @@ static void do_login_request(const credentials *c, login_result *lr)
     strbuf        enc;
     http_response resp;
     const char   *url = login_url();
+    char          nasid[16];
+    char          ip[64];
 
     memset(lr, 0, sizeof(*lr));
     sb_init(&form);
     sb_init(&enc);
+
+    resolve_nasid(c, nasid, sizeof(nasid));
+    ip[0] = '\0';
+    {
+        url_parts u;
+        if (url_parse(url, &u) == 0) {
+            (void)local_ip_for(u.host, u.port, ip, sizeof(ip));
+        }
+    }
 
     if (url_encode(c->username, &enc) != 0) {
         copy_str(lr->error, sizeof(lr->error), "内存不足");
@@ -2239,11 +2429,20 @@ static void do_login_request(const credentials *c, login_result *lr)
         goto cleanup;
     }
     if (sb_add(&form, "&password=") != 0 || sb_add(&form, enc.data) != 0
-        || sb_add(&form, "&nasId=1") != 0) {
+        || sb_add(&form, "&nasId=") != 0 || sb_add(&form, nasid) != 0) {
         copy_str(lr->error, sizeof(lr->error), "内存不足");
         goto cleanup;
     }
+    /* 新门户的前端还会带上 userIpv4；拿不到就不带，别发 0.0.0.0 上去 */
+    if (ip[0] != '\0') {
+        if (sb_add(&form, "&userIpv4=") != 0 || sb_add(&form, ip) != 0) {
+            copy_str(lr->error, sizeof(lr->error), "内存不足");
+            goto cleanup;
+        }
+    }
 
+    init_portal_host();
+    (void)portal_csrf_fetch(0);            /* 新门户要求 cookie + CSRF token */
     if (http_request("POST", url,
                      "application/x-www-form-urlencoded;charset=UTF-8",
                      form.data, LOGIN_TIMEOUT_SEC, &resp) != 0) {
@@ -2377,6 +2576,12 @@ static int run_login_flow(const credentials *c, int verbose, int *retryable)
     }
 
     if (!(lr.has_code && lr.code == 0)) {
+        if (lr.raw[0] != '\0' && strstr(lr.raw, "CSRF") != NULL) {
+            printf("\n登录失败：门户要求 CSRF 校验，请求被拒绝（CSRF token mismatch）。\n");
+            printf("这通常说明 /api/csrf-token 取 token 或会话 cookie 失败。\n");
+            printf("请用 -v 运行看 [门户] 那行是否显示“会话 cookie：有”。\n");
+            return EXIT_FAIL;
+        }
         printf("\n登录失败：%s\n",
                lr.has_code ? "账号或密码不正确（或账号被锁定）"
                            : "服务器返回异常，请稍后重试");

@@ -563,7 +563,7 @@ crontab -e
 
 | 项目 | 值 |
 | --- | --- |
-| 请求地址 | `http://59.68.177.9/api/account/login` |
+| 请求地址 | `http://59.68.177.12/api/account/login` |
 | 请求方式 | `POST` |
 | `Content-Type` | `application/x-www-form-urlencoded;charset=UTF-8` |
 | 表单参数 | `username=<学号>`、`password=<密码，已 URL 编码>`、`nasId=1` |
@@ -581,7 +581,7 @@ crontab -e
 2. `GET http://www.baidu.com` 探测是否已经在线，判定规则如下（**原则：拿不准就算未联网**）：
    - `3xx`：只有跳转目标**属于同一个站点**才算通 —— 同域或互为子域，或同一个注册域
      （例如 `www.baidu.com` → `https://www.baidu.com`、`www.bing.com` → `cn.bing.com` 都是正常的站内跳转）；
-     跳到别的站点（校园网门户的典型表现，例如跳到 `59.68.177.9`）判为未联网；
+     跳到别的站点（校园网门户的典型表现，例如跳到 `59.68.177.12`）判为未联网；
    - `204`：判为通；
    - `200`：正文里必须出现**真实站点的特征**才判为通。默认探测百度时要求出现
      `<!--STATUS OK-->`（百度首页自带的特征注释），或者出现“百度一下”且响应体足够大；
@@ -602,15 +602,30 @@ crontab -e
 
 | 用途 | 请求 | 说明 |
 | --- | --- | --- |
-| 查在线账号 | `GET /api/account/status?ip=<本机IP>&nasId=1` | 返回 `{"code":0,"msg":"在线","online":{...,"Username":"2026..."}}` |
-| 退出登录 | `GET /api/account/logout` | 按 IP 退出，不需要账号表单；`code=1` 表示失败 |
+| 取 CSRF token | `GET /api/csrf-token` | 返回 `{"csrf_token":"..."}`，同时下发会话 cookie（如 `yudear=...`） |
+| 读门户配置 | `GET /api/config` | `data.config.default_nas` 决定 nasId；`err_count_captcha` 决定几次失败后要验证码 |
+| 查在线账号 | `GET /api/account/status?ip=<本机IP>&nasId=<nasId>` | 返回 `{"code":0,"msg":"在线","online":{...,"Username":"2026..."}}` |
+| 登录 | `POST /api/account/login` | 表单 `username/password/nasId/userIpv4`，必须带 `Cookie` + `X-CSRF-Token` |
+| 退出登录 | `GET /api/account/logout?userIpv4=<本机IP>&nasId=<nasId>` | 按 IP 退出；`code=1` 表示失败 |
 
-> 注意两点坑：**账号键是 `Username`（大写 U）**，且嵌在 `online` 对象里；
-> 退出是 **GET** 而不是 POST（门户前端就是 `$.get(host_url + "/account/logout")`）。
-> 程序对 JSON 键名做了大小写不敏感匹配，所以 `Username` / `username` 都能认。
+**三个坑（都踩过）**：
+
+1. **账号键是 `Username`（大写 U）**，且嵌在 `online` 对象里；
+   程序对 JSON 键名做了大小写不敏感匹配，`Username` / `username` 都能认。
+2. **退出是 GET 而不是 POST**，而且 2026-11 起要带 `userIpv4`、`nasId` 参数
+   （门户前端：`$.get(host_url + "/account/logout?" + $.param(postData))`）。
+3. **新门户加了 CSRF 防护**：只发 token 不灵，**token 与会话 cookie 绑定**。
+   正确做法是先 `GET /api/csrf-token`（记下 `Set-Cookie`），再在请求里同时带
+   `Cookie: <cookie>` 和 `X-CSRF-Token: <token>`，否则回 `400 {"error":"CSRF token mismatch"}`。
+   程序里这两个值只在**门户主机**上附加，不会发给百度等第三方站点。
+
+> 还有一个反直觉行为：当**该 IP 已在线**时，`/api/account/login` 会直接回 `code=0`，
+> 不校验账号密码。所以“登录成功”只代表这个 IP 已认证，不代表密码正确。
 
 这两个接口各校部署可能不同，所以程序仍保留“可配置 + 可自发现”：
 
+- **nasId 不再写死**：配置文件里没有 `nasid=` 时，程序会问门户的 `/api/config`
+  要 `default_nas`（当前是 `2`），取不到才退回 `1`。
 - 查询（只读）：按顺序试以下地址，第一个返回 JSON 的就被采用，并在本次运行内缓存
   ```
   /api/account/status?ip=%IP%&nasId=%NASID%     ← WUST 用的就是这个
@@ -622,7 +637,7 @@ crontab -e
   ```
   地址模板里可用占位符 `%IP%`（本机在校园网的 IP，程序用 UDP connect 探测）、
   `%NASID%`、`%USER%`。
-- 退出：默认 `GET /api/account/logout`。
+- 退出：默认 `GET /api/account/logout?userIpv4=%IP%&nasId=%NASID%`。
 
 **如果在你学校对不上**，用一条命令就能确定：
 
@@ -635,9 +650,9 @@ wust-auth.exe -w
 
 ```ini
 # wust_config.ini 里可以追加这三行（都可选）
-nasid=1
-session_url=http://59.68.177.9/api/account/info?ip=%IP%&nasId=%NASID%
-logout_url=http://59.68.177.9/api/account/logout
+nasid=2
+session_url=http://59.68.177.12/api/account/status?ip=%IP%&nasId=%NASID%
+logout_url=http://59.68.177.12/api/account/logout?userIpv4=%IP%&nasId=%NASID%
 ```
 
 **为什么不用 libcurl**：认证接口是明文 HTTP，用系统自带 socket 就能完成；

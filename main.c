@@ -84,7 +84,7 @@
 /* 常量                                                                */
 /* ------------------------------------------------------------------ */
 #define APP_NAME            "wust-auth"
-#define APP_VERSION         "1.5"
+#define APP_VERSION         "1.6"
 #define CONFIG_FILE_NAME    "wust_config.ini"
 #define LOG_FILE_NAME       "wust-auth.log"
 /* config_load 在没有文件时给出的原因；首次运行时不必当成错误展示 */
@@ -1915,6 +1915,7 @@ typedef struct {
     int  known;                 /* 1 = 查询成功（哪怕结果是“没人在线”） */
     int  ours;                  /* 1 = 在线账号就是配置文件里的那个 */
     char user[128];             /* 在线账号，空表示没有在线会话 */
+    char mac[32];               /* 在线会话的 MAC，退出时要用 */
     char endpoint[320];         /* 真正查询成功的地址（便于写回配置） */
     char raw[512];              /* 原始响应片段，-v 时打印 */
     char error[256];
@@ -2254,6 +2255,7 @@ static void session_query(const credentials *c, int verbose, session_info *si)
             copy_str(si->endpoint, sizeof(si->endpoint), cand[i]);
             copy_str(g_session_endpoint, sizeof(g_session_endpoint), cand[i]);
             (void)parse_online_user(resp.body, si->user, sizeof(si->user));
+            (void)json_get_str(resp.body, "UserMac", si->mac, sizeof(si->mac));
             http_response_free(&resp);
             return;
         }
@@ -2308,14 +2310,15 @@ static int session_is_ours(const session_info *si, const credentials *c)
  * 返回 0 表示门户回话说成功（是否真的下线由调用方再查一次确认）。
  */
 static int session_logout(const credentials *c, const char *online_user,
-                          int verbose, char *msg, size_t msglen)
+                          const char *user_mac, int verbose,
+                          char *msg, size_t msglen)
 {
     char         origin[320];
-    char         url[600];
+    char         url[900];
     long         code = -1;
     http_response resp;
 
-    (void)online_user;                     /* 接口按 IP 退出，不需要账号 */
+    (void)online_user;
     if (msglen > 0u) {
         msg[0] = '\0';
     }
@@ -2324,12 +2327,13 @@ static int session_logout(const credentials *c, const char *online_user,
         copy_str(url, sizeof(url), c->logout_url);
     } else {
         /*
-         * 新门户的退出请求是
+         * 与门户前端完全一致的参数形状（含空值）：
          *   $.get(host_url + "/account/logout?" + $.param(postData))
-         * 要带上 userIpv4 / nasId 这些参数，按 IP 定位要退出的会话。
+         * 抓包确认浏览器发的就是这一串，少一个键都会被判“参数无效”。
          */
         char      ip[64];
         char      nasid[16];
+        char      mac[128];
         url_parts u;
 
         if (portal_origin(origin, sizeof(origin)) != 0) {
@@ -2341,9 +2345,20 @@ static int session_logout(const credentials *c, const char *online_user,
         if (url_parse(login_url(), &u) == 0) {
             (void)local_ip_for(u.host, u.port, ip, sizeof(ip));
         }
+        mac[0] = '\0';
+        if (user_mac != NULL && *user_mac != '\0') {
+            strbuf enc;
+            sb_init(&enc);
+            if (url_encode(user_mac, &enc) == 0 && enc.data != NULL) {
+                copy_str(mac, sizeof(mac), enc.data);
+            }
+            sb_free(&enc);
+        }
         if (snprintf(url, sizeof(url),
-                     "%s/api/account/logout?userIpv4=%s&nasId=%s",
-                     origin, ip, nasid) >= (int)sizeof(url)) {
+                     "%s/api/account/logout?"
+                     "username=&password=&switchip=&nasId=%s&userIpv4=%s&userMac=%s"
+                     "&captcha=&captchaId=&isp=&timeLimit=",
+                     origin, nasid, ip, mac) >= (int)sizeof(url)) {
             copy_str(msg, msglen, "退出地址过长");
             return -1;
         }
@@ -2515,11 +2530,15 @@ static int run_login_flow(const credentials *c, int verbose, int *retryable)
 
             printf("      在线的是【%s】，不是你（%s）。\n", si.user, c->username);
             printf("      正在退出这个会话，然后用你自己的账号重新登录 ...\n");
-            if (session_logout(c, si.user, verbose, lmsg, sizeof(lmsg)) != 0) {
+            if (session_logout(c, si.user, si.mac, verbose, lmsg, sizeof(lmsg)) != 0) {
                 printf("      退出失败：%s\n", lmsg[0] != '\0' ? lmsg : "未知原因");
                 printf("\n登录失败：当前 IP 上挂着别人的账号（%s），自动退出没成功。\n",
                        si.user);
-                printf("请打开浏览器访问任意网页，在门户页面点“退出”，再运行本程序。\n");
+                printf("注意：门户的「退出」接口目前对任何请求都返回“参数无效”（门户自身的问题），\n");
+                printf("      在网页上点“退出”同样会失败。可以试试：\n");
+                printf("      1) 打开自服务 http://59.68.177.12:8080 在“在线设备”里下线该会话；\n");
+                printf("      2) 等会话超时后再运行本程序；\n");
+                printf("      3) 仍未解决请联系网络中心。\n");
                 return EXIT_FAIL;
             }
             msleep(600u);
@@ -2529,7 +2548,9 @@ static int run_login_flow(const credentials *c, int verbose, int *retryable)
                 if (after.known && after.user[0] != '\0'
                     && session_is_ours(&after, c) == 0) {
                     printf("      退出没生效，当前仍是【%s】。\n", after.user);
-                    printf("\n登录失败：无法退出他人的在线会话，请手动在门户点“退出”后重试。\n");
+                    printf("\n登录失败：无法退出他人的在线会话（门户退出接口返回“参数无效”）。\n");
+                    printf("请到自服务 http://59.68.177.12:8080 的“在线设备”里下线该会话，\n");
+                    printf("或等会话超时后重试。\n");
                     return EXIT_FAIL;
                 }
             }
@@ -3052,8 +3073,12 @@ int main(int argc, char **argv)
             return EXIT_OK;
         }
         printf("正在退出在线账号：%s ...\n", si.user);
-        if (session_logout(&cred, si.user, verbose, lmsg, sizeof(lmsg)) != 0) {
+        if (session_logout(&cred, si.user, si.mac, verbose, lmsg, sizeof(lmsg)) != 0) {
             printf("退出请求失败：%s\n", (lmsg[0] != '\0') ? lmsg : "未知原因");
+            if (strstr(lmsg, "参数无效") != NULL) {
+                printf("说明：门户的退出接口目前对任何请求（包括它自己的网页）都返回“参数无效”，\n");
+                printf("      这是门户侧的问题。可改用自服务 http://59.68.177.12:8080 下线设备。\n");
+            }
 #ifdef _WIN32
             WSACleanup();
 #endif

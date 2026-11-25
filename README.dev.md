@@ -606,7 +606,7 @@ crontab -e
 | 读门户配置 | `GET /api/config` | `data.config.default_nas` 决定 nasId；`err_count_captcha` 决定几次失败后要验证码 |
 | 查在线账号 | `GET /api/account/status?ip=<本机IP>&nasId=<nasId>` | 返回 `{"code":0,"msg":"在线","online":{...,"Username":"2026..."}}` |
 | 登录 | `POST /api/account/login` | 表单 `username/password/nasId/userIpv4`，必须带 `Cookie` + `X-CSRF-Token` |
-| 退出登录 | `GET /api/account/logout?userIpv4=<本机IP>&nasId=<nasId>` | 按 IP 退出；`code=1` 表示失败 |
+| 退出登录 | `GET /api/account/logout?username=&password=&switchip=&nasId=<N>&userIpv4=<IP>&userMac=<MAC>&captcha=&captchaId=&isp=&timeLimit=` | 所有键都要带（可为空）；**当前门户对任何请求都返回 `{"code":1,"msg":"参数无效"}`，包括门户自己的网页** |
 
 **三个坑（都踩过）**：
 
@@ -621,6 +621,15 @@ crontab -e
 
 > 还有一个反直觉行为：当**该 IP 已在线**时，`/api/account/login` 会直接回 `code=0`，
 > 不校验账号密码。所以“登录成功”只代表这个 IP 已认证，不代表密码正确。
+
+> **退出接口目前是坏的（门户侧问题，2026-11 确认）**：
+> 抓包拿到浏览器自己发的请求
+> `logout?username=&password=&switchip=&nasId=2&userIpv4=10.15.65.86&userMac=&captcha=&captchaId=&isp=&timeLimit=`，
+> 在网页上点「退出」同样弹出“参数无效”。程序按这个形状原样重放、并补上真实的 `userMac`、
+> 换过 `nasId`(0/1/2/3)、`switchip`(网关)、POST、Referer/Origin，全部返回“参数无效”。
+> 结论：**这不是客户端参数问题**，等门户修复后程序无需改动即可生效。
+> 期间若遇到“别人的账号占着本机 IP”，只能去自服务 `http://59.68.177.12:8080` 的
+> “在线设备”里下线，或等会话超时。
 
 这两个接口各校部署可能不同，所以程序仍保留“可配置 + 可自发现”：
 
